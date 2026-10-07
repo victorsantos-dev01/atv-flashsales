@@ -1,0 +1,150 @@
+x-app-env: &app-env
+  PORT: 3000
+  DB_HOST: postgres
+  DB_PORT: 5432
+  DB_USER: ${POSTGRES_USER:-postgres}
+  DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+  DB_NAME: ${POSTGRES_DB:-flash_sales}
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+
+x-app: &app
+  build: .
+  image: flashsales-api:local
+  environment: *app-env
+  networks:
+    - app-net
+
+services:
+  # Job de inicializacao: cria as tabelas uma unica vez, antes das replicas subirem
+  db-init:
+    <<: *app
+    restart: "no"
+    command:
+      - node
+      - -e
+      - >-
+        const { AppDataSource } = require('./dist/config/database');
+        AppDataSource.initialize()
+        .then(() => { console.log('Schema pronto'); return AppDataSource.destroy(); })
+        .then(() => process.exit(0))
+        .catch((e) => { console.error(e); process.exit(1); });
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # API de vendas (checkout): 2 replicas, atras do nginx
+  api:
+    <<: *app
+    restart: unless-stopped
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Mesma imagem, isolada para a rota pesada /tickets/export
+  api-export:
+    <<: *app
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  # Gateway: unico ponto de entrada (porta 3000)
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+      api-export:
+        condition: service_started
+    networks:
+      - app-net
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-flash_sales}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-flash_sales}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - app-net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - app-net
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - promdata:/prometheus
+    depends_on:
+      - api
+      - api-export
+    networks:
+      - app-net
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafanadata:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - app-net
+
+volumes:
+  pgdata:
+  promdata:
+  grafanadata:
+
+networks:
+  app-net:
+    driver: bridge
